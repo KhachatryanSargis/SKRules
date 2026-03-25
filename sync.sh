@@ -1,0 +1,215 @@
+#!/bin/bash
+set -euo pipefail
+
+#
+# SKRules/sync.sh — Sync rules, agents, skills, and commands into any iOS project
+#
+# Usage:
+#   ./sync.sh /path/to/project                            # sync everything
+#   ./sync.sh /path/to/project --rules-only                # sync only rules
+#   ./sync.sh /path/to/project code-style anti-patterns    # sync specific rules only
+#   ./sync.sh                                              # sync into current directory
+#
+# What gets synced:
+#   .claude/rules/   — individual rule files (auto-loaded by Claude Code)
+#   .claude/agents/  — specialized subagents (planner, code-reviewer, etc.)
+#   .claude/skills/  — workflow skills (tdd-workflow, swiftui-patterns, etc.)
+#   .claude/commands/ — slash commands (/plan, /code-review, /verify, etc.)
+#   CLAUDE.md        — project-specific content only (from CLAUDE.local.md if present)
+#
+# Configuration files (placed in the target project):
+#   .claude-rules-config   — list rule names to include (one per line, without .md)
+#   CLAUDE.local.md        — project-specific rules (becomes CLAUDE.md)
+#   .skrules-config        — components to sync: rules, agents, skills, commands (default: all)
+#
+# Note: Package-scoped CLAUDE.md files (e.g. SKCore/CLAUDE.md) are owned by
+# each package's own repo and committed alongside the code — not managed here.
+#
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+RULES_DIR="$SCRIPT_DIR/rules"
+AGENTS_DIR="$SCRIPT_DIR/agents"
+SKILLS_DIR="$SCRIPT_DIR/skills"
+COMMANDS_DIR="$SCRIPT_DIR/commands"
+
+# Validate rule name (no path traversal)
+validate_rule_name() {
+    local name="$1"
+    if [[ "$name" == *".."* ]] || [[ "$name" == *"/"* ]]; then
+        echo "ERROR: Invalid rule name '$name' — must not contain '..' or '/'" >&2
+        return 1
+    fi
+    return 0
+}
+
+TARGET_DIR="${1:-.}"
+# Only shift if at least one argument was provided
+[ $# -gt 0 ] && shift || true
+
+# Handle flags
+RULES_ONLY=false
+if [ "${1:-}" = "--rules-only" ]; then
+    RULES_ONLY=true
+    shift
+fi
+
+if [ ! -d "$TARGET_DIR" ]; then
+    echo "Error: Target directory '$TARGET_DIR' does not exist."
+    exit 1
+fi
+
+CONFIG_FILE="$TARGET_DIR/.claude-rules-config"
+LOCAL_FILE="$TARGET_DIR/CLAUDE.local.md"
+OUTPUT_FILE="$TARGET_DIR/CLAUDE.md"
+SKRULES_CONFIG="$TARGET_DIR/.skrules-config"
+
+# ─── Determine which components to sync ──────────────────────────────
+SYNC_RULES=true
+SYNC_AGENTS=true
+SYNC_SKILLS=true
+SYNC_COMMANDS=true
+
+if [ "$RULES_ONLY" = true ]; then
+    SYNC_AGENTS=false
+    SYNC_SKILLS=false
+    SYNC_COMMANDS=false
+elif [ -f "$SKRULES_CONFIG" ]; then
+    SYNC_RULES=false
+    SYNC_AGENTS=false
+    SYNC_SKILLS=false
+    SYNC_COMMANDS=false
+    while IFS= read -r line; do
+        line="$(echo "$line" | sed 's/#.*//' | xargs)"
+        case "$line" in
+            rules)    SYNC_RULES=true ;;
+            agents)   SYNC_AGENTS=true ;;
+            skills)   SYNC_SKILLS=true ;;
+            commands) SYNC_COMMANDS=true ;;
+        esac
+    done < "$SKRULES_CONFIG"
+
+    # If config file was empty or had no recognized entries, default to all
+    if [ "$SYNC_RULES" = false ] && [ "$SYNC_AGENTS" = false ] && [ "$SYNC_SKILLS" = false ] && [ "$SYNC_COMMANDS" = false ]; then
+        echo "WARNING: .skrules-config exists but contains no recognized entries (rules, agents, skills, commands). Syncing all components." >&2
+        SYNC_RULES=true
+        SYNC_AGENTS=true
+        SYNC_SKILLS=true
+        SYNC_COMMANDS=true
+    fi
+fi
+
+# ─── Determine which shared rules to include ─────────────────────────
+
+RULES=()
+if [ $# -gt 0 ]; then
+    RULES=("$@")
+elif [ -f "$CONFIG_FILE" ]; then
+    while IFS= read -r line; do
+        line="$(echo "$line" | sed 's/#.*//' | xargs)"
+        [ -n "$line" ] && RULES+=("$line")
+    done < "$CONFIG_FILE"
+else
+    for f in "$RULES_DIR"/*.md; do
+        name="$(basename "$f" .md)"
+        RULES+=("$name")
+    done
+fi
+
+for rule in "${RULES[@]}"; do
+    validate_rule_name "$rule" || exit 1
+    if [ ! -f "$RULES_DIR/$rule.md" ]; then
+        echo "Error: Rule '$rule' not found in $RULES_DIR/"
+        echo "Available rules:"
+        ls "$RULES_DIR"/*.md 2>/dev/null | xargs -I{} basename {} .md | sed 's/^/  /'
+        exit 1
+    fi
+done
+
+# ─── 1. Sync rules into .claude/rules/ ──────────────────────────────
+
+if [ "$SYNC_RULES" = true ]; then
+    RULES_TARGET="$TARGET_DIR/.claude/rules"
+    mkdir -p "$RULES_TARGET"
+
+    count=0
+    for rule in "${RULES[@]}"; do
+        cp "$RULES_DIR/$rule.md" "$RULES_TARGET/$rule.md"
+        count=$((count + 1))
+    done
+
+    echo "✅ Rules   — $count rules → $RULES_TARGET/"
+
+    # CLAUDE.md = project-specific content only (from CLAUDE.local.md)
+    if [ -f "$LOCAL_FILE" ]; then
+        cp "$LOCAL_FILE" "$OUTPUT_FILE"
+        echo "✅ CLAUDE.md — copied from CLAUDE.local.md"
+    elif [ -f "$OUTPUT_FILE" ]; then
+        # Check if existing CLAUDE.md was auto-generated by a previous sync
+        if head -1 "$OUTPUT_FILE" 2>/dev/null | grep -q "Auto-generated by SKRules"; then
+            rm "$OUTPUT_FILE"
+            echo "🧹 CLAUDE.md — removed old auto-generated file (rules now in .claude/rules/)"
+        fi
+    fi
+fi
+
+# ─── 2. Sync agents ──────────────────────────────────────────────────
+
+if [ "$SYNC_AGENTS" = true ] && [ -d "$AGENTS_DIR" ]; then
+    AGENTS_TARGET="$TARGET_DIR/.claude/agents"
+    mkdir -p "$AGENTS_TARGET"
+
+    count=0
+    for f in "$AGENTS_DIR"/*.md; do
+        [ -f "$f" ] || continue
+        cp "$f" "$AGENTS_TARGET/"
+        count=$((count + 1))
+    done
+
+    echo "✅ Agents  — $count agents → $AGENTS_TARGET/"
+fi
+
+# ─── 3. Sync skills ──────────────────────────────────────────────────
+
+if [ "$SYNC_SKILLS" = true ] && [ -d "$SKILLS_DIR" ]; then
+    SKILLS_TARGET="$TARGET_DIR/.claude/skills"
+    mkdir -p "$SKILLS_TARGET"
+
+    count=0
+    for d in "$SKILLS_DIR"/*/; do
+        [ -d "$d" ] || continue
+        skill_name="$(basename "$d")"
+        mkdir -p "$SKILLS_TARGET/$skill_name"
+        if [ -d "$d" ]; then
+            cp -r "$d/." "$SKILLS_TARGET/$skill_name/" || echo "WARNING: Failed to copy skill $skill_name" >&2
+        fi
+        count=$((count + 1))
+    done
+
+    echo "✅ Skills  — $count skills → $SKILLS_TARGET/"
+fi
+
+# ─── 4. Sync commands ────────────────────────────────────────────────
+
+if [ "$SYNC_COMMANDS" = true ] && [ -d "$COMMANDS_DIR" ]; then
+    COMMANDS_TARGET="$TARGET_DIR/.claude/commands"
+    mkdir -p "$COMMANDS_TARGET"
+
+    count=0
+    for f in "$COMMANDS_DIR"/*.md; do
+        [ -f "$f" ] || continue
+        cp "$f" "$COMMANDS_TARGET/"
+        count=$((count + 1))
+    done
+
+    echo "✅ Commands — $count commands → $COMMANDS_TARGET/"
+fi
+
+# ─── Summary ─────────────────────────────────────────────────────────
+
+echo ""
+echo "Done. Components synced to: $TARGET_DIR"
+if [ "$SYNC_RULES" = true ];    then echo "   Rules:    .claude/rules/ (${RULES[*]})"; fi
+if [ -f "$LOCAL_FILE" ];         then echo "   CLAUDE.md: from CLAUDE.local.md"; fi
+if [ "$SYNC_AGENTS" = true ];   then echo "   Agents:   .claude/agents/"; fi
+if [ "$SYNC_SKILLS" = true ];   then echo "   Skills:   .claude/skills/"; fi
+if [ "$SYNC_COMMANDS" = true ]; then echo "   Commands: .claude/commands/"; fi
